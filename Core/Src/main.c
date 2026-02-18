@@ -11,23 +11,30 @@
   ******************************************************************************
   */
 /* USER CODE END Header */
-
+/* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "i2c.h"
 #include "usart.h"
 #include "gpio.h"
-#include "ppg_hr.h"
 
+/* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <math.h>
 #include <stdbool.h>
 #include <string.h>
 
+#include "ppg_hr.h"
+
 #include "ssd1306.h"
 #include "ssd1306_fonts.h"
 /* USER CODE END Includes */
 
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 /* === BMP280/BME280 === */
 #define BMP280_ADDR            0x76
@@ -75,13 +82,23 @@
 #define SPO2_SPIKE_REJECT_PCT       6.0f     // max change per 1s frame
 #define SPO2_MIN_DC                 1000.0f  // กันหารศูนย์/สัญญาณไม่พอ
 #define SPO2_MIN_AC                 50.0f    // กัน noise-only (หน่วย ADC)
-#define SPO2_FAIL_STREAK_FORCE_LOST 3u       // Mode B: fail ต่อเนื่องกี่เฟรมถึง force SIGNAL_LOST
+#define SPO2_FAIL_STREAK_FORCE_LOST 3u       // fail ต่อเนื่องกี่เฟรมถึง force SIGNAL_LOST
 
-/* OLED refresh rate (กันกระพริบ) */
+/* OLED refresh rate */
 #define OLED_UPDATE_MS              250u
+
+/* === RUN/STOP Button ===
+   สมมติปุ่ม PA0 ต่อกดลง GND และตั้ง Pull-up ใน CubeMX */
+#define BTN_GPIO_Port   GPIOA
+#define BTN_Pin         GPIO_PIN_0
+#define BTN_DEBOUNCE_MS 200u
 /* USER CODE END PD */
 
-void SystemClock_Config(void);
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
 /* BMP calib */
@@ -89,6 +106,7 @@ static uint16_t dig_T1; static int16_t dig_T2, dig_T3;
 static uint16_t dig_P1; static int16_t dig_P2, dig_P3, dig_P4, dig_P5, dig_P6, dig_P7, dig_P8, dig_P9;
 static int32_t t_fine = 0;
 
+/* PPG pipeline */
 static HR_State g_hr;
 
 static bool bmp_ok = false;
@@ -103,13 +121,24 @@ static int last_hr = 75, last_resp = 16, last_hrv = 35;
 /* I2C error streak (frame-level) */
 static uint32_t i2c_fail_streak = 0;
 
-/* SpO2 quality fail streak (Mode B) */
+/* SpO2 quality fail streak */
 static uint32_t spo2_fail_streak = 0;
 
 /* OLED */
 static uint32_t next_oled_ms = 0;
+
+/* 1Hz scheduler */
+static uint32_t next_frame_ms = 0;
+static uint32_t ts = 0;
+
+/* RUN/STOP */
+static volatile uint8_t  g_run = 0;            // 0=STOP, 1=RUN
+static volatile uint32_t g_btn_last_ms = 0;    // debounce time
+static volatile uint8_t  g_run_toggle_req = 0; // ISR request
 /* USER CODE END PV */
 
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 static uint8_t  i2c_read_u8(uint8_t dev7, uint8_t reg);
 static int      i2c_read_buf(uint8_t dev7, uint8_t reg, uint8_t *buf, uint16_t len);
@@ -131,10 +160,28 @@ static int      max30102_read_sample(uint32_t *red, uint32_t *ir);
 
 /* OLED helpers */
 static void OLED_ShowBoot(void);
-static void OLED_ShowData(uint32_t ts, bool lost);
+static void OLED_ShowPaused(void);
+static void OLED_ShowData(uint32_t ts_local, bool lost);
 /* USER CODE END PFP */
 
+/* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+/* ===== Button EXTI ===== */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  if (GPIO_Pin == BTN_Pin)
+  {
+    uint32_t now = HAL_GetTick();
+    if ((now - g_btn_last_ms) >= BTN_DEBOUNCE_MS)
+    {
+      g_btn_last_ms = now;
+      g_run_toggle_req = 1;
+    }
+  }
+}
+
+/* ===== I2C helpers ===== */
 static uint8_t i2c_read_u8(uint8_t dev7, uint8_t reg)
 {
   uint8_t val = 0xFF;
@@ -153,7 +200,7 @@ static int i2c_write_u8(uint8_t dev7, uint8_t reg, uint8_t val)
   return (HAL_I2C_Mem_Write(&hi2c1, (dev7 << 1), reg, I2C_MEMADD_SIZE_8BIT, &val, 1, 100) == HAL_OK);
 }
 
-/* ===== BMP280/BME280 ===== */
+/* ===== BMP280 ===== */
 static uint16_t u16le(const uint8_t *p){ return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
 static int16_t  s16le(const uint8_t *p){ return (int16_t)u16le(p); }
 
@@ -256,6 +303,7 @@ static int max30102_init(void)
 
   (void)i2c_write_u8(MAX30102_ADDR, MAX30102_REG_FIFO_CONFIG, (0b010 << 5) | (0 << 4) | 0x0F);
 
+  /* ADC range=4096, SR=100sps, PW=411us (18-bit) */
   (void)i2c_write_u8(MAX30102_ADDR, MAX30102_REG_SPO2_CONFIG,
                      (0b01 << 5) | (0b011 << 2) | 0b11);
 
@@ -303,57 +351,76 @@ static void OLED_ShowBoot(void)
   ssd1306_UpdateScreen();
 }
 
-static void OLED_ShowData(uint32_t ts, bool lost)
+static void OLED_ShowPaused(void)
 {
-  // update ทุก 250ms กันกระพริบ/หนัก I2C
+  uint32_t now = HAL_GetTick();
+  if ((int32_t)(now - next_oled_ms) < 0) return;
+  next_oled_ms = now + OLED_UPDATE_MS;
+
+  ssd1306_Fill(Black);
+  ssd1306_SetCursor(0, 0);
+  ssd1306_WriteString("PAUSED", Font_11x18, White);
+  ssd1306_SetCursor(0, 22);
+  ssd1306_WriteString("Press button", Font_7x10, White);
+  ssd1306_SetCursor(0, 34);
+  ssd1306_WriteString("to START", Font_7x10, White);
+  ssd1306_UpdateScreen();
+}
+
+static void OLED_ShowData(uint32_t ts_local, bool lost)
+{
   uint32_t now = HAL_GetTick();
   if ((int32_t)(now - next_oled_ms) < 0) return;
   next_oled_ms = now + OLED_UPDATE_MS;
 
   char line[32];
-
   ssd1306_Fill(Black);
 
-  // Line 1: status + ts
+  /* Line 1 */
   ssd1306_SetCursor(0, 0);
   if (lost) {
     ssd1306_WriteString("SIGNAL LOST", Font_7x10, White);
   } else {
-    snprintf(line, sizeof(line), "TS:%lu", (unsigned long)ts);
+    snprintf(line, sizeof(line), "TS:%lu", (unsigned long)ts_local);
     ssd1306_WriteString(line, Font_7x10, White);
   }
 
-  // Line 2: SpO2 + HR
+  /* Line 2: SpO2 + HR */
   ssd1306_SetCursor(0, 14);
   snprintf(line, sizeof(line), "SpO2:%4.1f", last_spo2);
   ssd1306_WriteString(line, Font_7x10, White);
 
-  // ✅ HR ใช้ตัวเล็กลงกันตกขอบ (เดิมใช้ Font_7x10)
-  ssd1306_SetCursor(80, 16); // +2px ให้บาลานซ์กับ 6x8
+  /* HR ตัวเล็กลงกันตกขอบ */
+  ssd1306_SetCursor(82, 16);
   snprintf(line, sizeof(line), "HR:%3d", last_hr);
   ssd1306_WriteString(line, Font_6x8, White);
 
-  // Line 3: Resp + HRV
+  /* Line 3: Resp + HRV */
   ssd1306_SetCursor(0, 30);
   snprintf(line, sizeof(line), "Resp:%2d", last_resp);
   ssd1306_WriteString(line, Font_7x10, White);
 
-  // ✅ HRV ใช้ตัวเล็กลงกันตกขอบ (สำคัญ)
-  ssd1306_SetCursor(80, 32); // +2px ให้บาลานซ์กับ 6x8
+  /* HRV ตัวเล็กลงกันตกขอบ (แก้ตกขอบชัวร์) */
+  ssd1306_SetCursor(76, 32);
   snprintf(line, sizeof(line), "HRV:%3d", last_hrv);
   ssd1306_WriteString(line, Font_6x8, White);
 
-  // Line 4: Alt
+  /* Line 4: Alt (ลดความยาวกันล้น) */
   ssd1306_SetCursor(0, 46);
-  snprintf(line, sizeof(line), "Alt:%6.1f m", last_alt);
+  snprintf(line, sizeof(line), "Alt:%5.1fm", last_alt);
   ssd1306_WriteString(line, Font_7x10, White);
 
   ssd1306_UpdateScreen();
 }
 /* USER CODE END 0 */
 
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
 int main(void)
 {
+  /* MCU Configuration--------------------------------------------------------*/
   HAL_Init();
   SystemClock_Config();
 
@@ -361,6 +428,7 @@ int main(void)
   MX_USART1_UART_Init();
   MX_I2C1_Init();
 
+  /* USER CODE BEGIN 2 */
   bmp_ok = (bmp280_init() == 1);
   max_ok = (max30102_init() == 1);
 
@@ -380,21 +448,64 @@ int main(void)
   HR_Init(&g_hr, 100);
 
   last_good_ms = 0;
+  i2c_fail_streak = 0;
+  spo2_fail_streak = 0;
 
-  static uint32_t next_frame_ms = 0;
   next_frame_ms = HAL_GetTick();
-
   next_oled_ms = HAL_GetTick() + 50;
 
+  /* เริ่มต้นให้เป็น STOP (ต้องกดปุ่มถึงเริ่ม RUN) */
+  g_run = 0;
+  OLED_ShowPaused();
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
   while (1)
   {
+	    uint8_t btn = HAL_GPIO_ReadPin(BTN_GPIO_Port, BTN_Pin);
+
+	    printf("BTN=%d\r\n", btn);
+
+	    HAL_Delay(300);
+    /* ===== RUN/STOP toggle ===== */
+    if (g_run_toggle_req)
+    {
+      g_run_toggle_req = 0;
+      g_run = (g_run == 0) ? 1 : 0;
+
+      if (g_run)
+      {
+        next_frame_ms = HAL_GetTick();
+        ts = 0;
+
+        last_good_ms = 0;
+        i2c_fail_streak = 0;
+        spo2_fail_streak = 0;
+
+        HR_SetSignalOK(&g_hr, false);
+      }
+      else
+      {
+        HR_SetSignalOK(&g_hr, false);
+        OLED_ShowPaused();
+      }
+    }
+
+    /* STOP: ไม่อ่านเซนเซอร์ ไม่ส่ง UART */
+    if (!g_run)
+    {
+      OLED_ShowPaused();
+      HAL_Delay(20);
+      continue;
+    }
+
+    /* ===== 1Hz scheduler ===== */
     while ((int32_t)(HAL_GetTick() - next_frame_ms) < 0) { }
     uint32_t loop_start = next_frame_ms;
     next_frame_ms += 1000;
 
     uint32_t now = loop_start;
-
-    static uint32_t ts = 0;
     ts++;
 
     bool frame_i2c_ok = true;
@@ -414,10 +525,9 @@ int main(void)
     bool bmp_valid = bmp_ok && bmp_read_ok &&
                      (pressure_pa >= 30000.0f && pressure_pa <= 110000.0f);
 
-    if (bmp_valid)
-      altitude = pressure_to_altitude_m(pressure_pa);
+    if (bmp_valid) altitude = pressure_to_altitude_m(pressure_pa);
 
-    /* ---- MAX finger detect + SpO2 window stats ---- */
+    /* ---- MAX finger detect + HR feed + SpO2 window stats ---- */
     bool max_valid = false;
     bool spo2_frame_ok = false;
 
@@ -429,10 +539,7 @@ int main(void)
       int n = 0;
       int read_fail = 0;
 
-      /* ===== NEW: buffer IR samples + timestamps (กัน signal_ok กระตุกแล้ว reset HRV/Resp) ===== */
-      uint32_t ir_buf[90];
-      uint32_t t_buf[90];
-      uint8_t  buf_n = 0;
+      HR_SetSignalOK(&g_hr, false);
 
       for (int k = 0; k < 90; k++)
       {
@@ -444,37 +551,32 @@ int main(void)
           ir_sumsq  += (uint64_t)ir  * (uint64_t)ir;
           n++;
 
-          if (buf_n < 90) {
-            ir_buf[buf_n] = ir;
-            t_buf[buf_n]  = HAL_GetTick();
-            buf_n++;
+          if (n >= 10)
+          {
+            float ir_avg_run = (float)ir_sum / (float)n;
+            bool finger_run = isfinite(ir_avg_run) && (ir_avg_run >= IR_FINGER_THRESHOLD);
+            HR_SetSignalOK(&g_hr, finger_run && frame_i2c_ok && (read_fail == 0));
           }
+
+          HR_ProcessSample(&g_hr, (uint32_t)ir, HAL_GetTick());
         }
         else
         {
           read_fail++;
+          HR_SetSignalOK(&g_hr, false);
         }
 
         HAL_Delay(10);
       }
 
-      if (read_fail > 20) {
-        frame_i2c_ok = false;
-      }
-
-      bool finger_ok = false;
-      float red_dc = 0.0f, ir_dc = 0.0f;
-      float red_ac = 0.0f, ir_ac = 0.0f;
+      if (read_fail > 20) frame_i2c_ok = false;
 
       if (n >= 10)
       {
-        red_dc = (float)red_sum / (float)n;
-        ir_dc  = (float)ir_sum  / (float)n;
+        float red_dc = (float)red_sum / (float)n;
+        float ir_dc  = (float)ir_sum  / (float)n;
 
-        if (isfinite(ir_dc) && ir_dc >= IR_FINGER_THRESHOLD) {
-          finger_ok = true;
-          max_valid = true;
-        }
+        if (isfinite(ir_dc) && ir_dc >= IR_FINGER_THRESHOLD) max_valid = true;
 
         float red_ex2 = (float)red_sumsq / (float)n;
         float ir_ex2  = (float)ir_sumsq  / (float)n;
@@ -485,8 +587,8 @@ int main(void)
         if (red_var < 0.0f) red_var = 0.0f;
         if (ir_var  < 0.0f) ir_var  = 0.0f;
 
-        red_ac = sqrtf(red_var);
-        ir_ac  = sqrtf(ir_var);
+        float red_ac = sqrtf(red_var);
+        float ir_ac  = sqrtf(ir_var);
 
         bool spo2_new_valid = true;
         if (!isfinite(red_dc) || !isfinite(ir_dc) || !isfinite(red_ac) || !isfinite(ir_ac)) spo2_new_valid = false;
@@ -523,18 +625,6 @@ int main(void)
         }
       }
 
-      /* ===== NEW: set signal_ok ONCE per frame ===== */
-      bool stream_ok = (finger_ok && frame_i2c_ok && (read_fail <= 20));
-      HR_SetSignalOK(&g_hr, stream_ok);
-
-      /* ===== NEW: feed HR/HRV/Resp ONLY when stream_ok ===== */
-      if (stream_ok)
-      {
-        for (uint8_t k = 0; k < buf_n; k++) {
-          HR_ProcessSample(&g_hr, (uint32_t)ir_buf[k], (uint32_t)t_buf[k]);
-        }
-      }
-
       if (max_valid && spo2_frame_ok) {
         spo2_fail_streak = 0;
       } else if (max_valid) {
@@ -547,16 +637,15 @@ int main(void)
     {
       frame_i2c_ok = false;
       spo2_fail_streak = 0;
-      HR_SetSignalOK(&g_hr, false);
     }
 
-    if (frame_i2c_ok) {
-      i2c_fail_streak = 0;
-    } else {
-      i2c_fail_streak++;
-    }
+    /* ---- I2C fail streak gating ---- */
+    if (frame_i2c_ok) i2c_fail_streak = 0;
+    else i2c_fail_streak++;
 
     now = HAL_GetTick();
+
+    HR_SetSignalOK(&g_hr, (max_valid && (i2c_fail_streak == 0)));
 
     bool valid_frame = (bmp_valid && max_valid && (i2c_fail_streak == 0) &&
                         (spo2_fail_streak < SPO2_FAIL_STREAK_FORCE_LOST));
@@ -566,6 +655,7 @@ int main(void)
       last_good_ms = now;
       last_alt = (isfinite(altitude) && altitude != 0.0f) ? altitude : 1.0f;
 
+      /* HR */
       if (HR_HasValid(&g_hr)) {
         float bpm = HR_GetBPM(&g_hr);
         if (bpm < 30.0f) bpm = 30.0f;
@@ -577,13 +667,12 @@ int main(void)
 
         int diff = new_hr - last_hr;
         if (diff < 0) diff = -diff;
-
         if (diff <= 15) last_hr = new_hr;
       }
 
+      /* Resp */
       if (RESP_HasValid(&g_hr)) {
         float rbpm = RESP_GetBPM(&g_hr);
-
         if (!isfinite(rbpm) || rbpm < RESP_MIN_BPM) rbpm = RESP_MIN_BPM;
         if (rbpm > RESP_MAX_BPM) rbpm = RESP_MAX_BPM;
 
@@ -593,13 +682,12 @@ int main(void)
 
         int rdiff = new_resp - last_resp;
         if (rdiff < 0) rdiff = -rdiff;
-
         if (rdiff <= RESP_SPIKE_REJECT_BPM) last_resp = new_resp;
       }
 
+      /* HRV */
       if (HRV_HasValid(&g_hr)) {
         float rmssd = HRV_GetRMSSD(&g_hr);
-
         if (!isfinite(rmssd) || rmssd < 1.0f) rmssd = 1.0f;
         if (rmssd > 300.0f) rmssd = 300.0f;
 
@@ -629,13 +717,17 @@ int main(void)
       {
         printf("%lu,%.1f,%d,%d,%d,%.1f\r\n",
                (unsigned long)ts, last_spo2, last_hr, last_resp, last_hrv, last_alt);
-
         OLED_ShowData(ts, false);
       }
     }
   }
+  /* USER CODE END WHILE */
 }
 
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
 void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
